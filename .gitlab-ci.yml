@@ -1,0 +1,103 @@
+# References:
+# - https://docs.gitlab.com/ee/ci/yaml
+# - https://docs.gitlab.com/ee/ci/variables/README.html#list-all-environment-variables
+
+# Gitlab doesn't have a runner tagged with shell
+# You need to register you PC as a runner
+# - https://docs.gitlab.com/runner/install/
+# - https://docs.gitlab.com/runner/register/index.html
+variables:
+  PROJECT_PATH: "$CI_PROJECT_DIR/angular-docker"
+  OUTPUT_PATH: "$PROJECT_PATH/artifacts"
+  APP_OUTPUT_PATH: "$PROJECT_PATH/artifacts/app"
+  APP_GITLAB_OUTPUT_PATH: "$PROJECT_PATH/artifacts/app-gitlab"
+  DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE/angular-app"
+  DOCKER_IMAGE_TAG: "$CI_COMMIT_REF_NAME-$CI_COMMIT_SHORT_SHA"
+  IS_RELEASE_PIPELINE: "$CI_COMMIT_TAG"
+
+stages:
+  - dependencies
+  - build
+  - package-publish
+  - docker-push
+  - deploy
+
+.dependencies_cache:
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules
+    policy: pull
+
+install_dependencies:
+  image: node:12-alpine
+  stage: dependencies
+  script:
+    - npm install
+  only:
+    - master
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules
+
+build:
+  stage: build
+  image: node:12-alpine
+  only:
+    - master
+  before_script:
+    - cd $PROJECT_PATH
+  script:
+    - npm install -g @angular/cli@9.1.0
+    - npm install
+    - ng build --prod
+  after_script:
+    - cp $PROJECT_PATH/Dockerfile $APP_OUTPUT_PATH
+  artifacts:
+    name: "angular-app-pipeline"
+    paths:
+      - $APP_OUTPUT_PATH
+    expire_in: 2 hours
+  extends: .dependencies_cache
+
+build-docker-image:
+  stage: package-publish
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    DOCKER_CONTEXT: "$PROJECT_PATH"
+    DOCKERFILE_PATH: "$PROJECT_PATH/Dockerfile"
+  before_script:
+
+    # Don't include commit SHA1 in docker tag for releases
+    # The OR condition with column makes sure the command
+    # always returns a success exit code to avoid making the job fail
+    - test $IS_RELEASE_PIPELINE && DOCKER_IMAGE_TAG=$CI_COMMIT_TAG || ":"
+    #- cd $APP_OUTPUT_PATH
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor --context $DOCKER_CONTEXT --dockerfile $DOCKERFILE_PATH --destination $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG
+  dependencies:
+    - build
+  only:
+    - master
+    - develop
+    - tags
+  
+publish-docker-image:
+  stage: docker-push
+  image:
+    name: gcr.io/go-containerregistry/crane:debug
+    entrypoint: [""]
+  script:
+  - crane auth login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  - crane tag $DOCKER_IMAGE_NAME:$DOCKER_IMAGE_TAG latest
+  needs:
+  - build-docker-image
